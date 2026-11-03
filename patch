@@ -1,0 +1,169 @@
+#!/usr/bin/env -S uv run --no-project python
+import os
+from pathlib import Path
+import re
+import runpy
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parent
+CLI = runpy.run_path(str(ROOT / "cli" / "patch.py"))
+GUI = runpy.run_path(str(ROOT / "gui" / "patch.py"))
+BACKUPS = Path.home() / ".agy-patches" / "backups"
+
+
+def run(command):
+    command = [str(part) for part in command]
+    print(f"+ {shlex.join(command)}")
+    subprocess.run(command, check=True)
+
+
+def target_state(module):
+    target = module["DEFAULT_TARGET"]
+    if not target.exists():
+        return "not found"
+    try:
+        return module["get_state"](target)
+    except (OSError, ValueError) as error:
+        return str(error)
+
+
+def show_states():
+    states = {"cli": target_state(CLI), "gui": target_state(GUI)}
+    labels = {
+        "original": "оригинал, можно патчить",
+        "patched": "уже пропатчен, можно повторно подписать",
+        "not found": "не найден",
+    }
+    print(f"1. CLI: {CLI['DEFAULT_TARGET']} — {labels.get(states['cli'], states['cli'])}")
+    print(f"2. GUI: {GUI['DEFAULT_TARGET']} — {labels.get(states['gui'], states['gui'])}")
+    return states
+
+
+def confirm(question, default=True):
+    suffix = "[Y/n]" if default else "[y/N]"
+    answer = input(f"{question} {suffix} ").strip().lower()
+    if not answer:
+        return default
+    return answer in ("y", "yes", "д", "да")
+
+
+def backup_original(module, version):
+    target = module["DEFAULT_TARGET"]
+    backup = BACKUPS / version / target.name
+    if not backup.exists():
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, backup)
+    if module["file_sha256"](backup) != module["ORIGINAL_SHA256"]:
+        raise ValueError(f"Резервная копия повреждена или имеет неизвестную версию: {backup}")
+    print(f"Резервная копия: {backup}")
+
+
+def ensure_patched(module, version):
+    target = module["DEFAULT_TARGET"]
+    state = module["get_state"](target)
+    if state == "patched":
+        print(f"{target}: бинарник уже пропатчен")
+        return
+    backup_original(module, version)
+    module["apply_patch"](target)
+    if module["current_bytes"](target) != module["PATCHED"]:
+        raise ValueError(f"Не удалось проверить патч: {target}")
+    print(f"{target}: патч применён")
+
+
+def antigravity_running():
+    commands = (
+        ["pgrep", "-x", "Antigravity"],
+        ["pgrep", "-f", re.escape(str(GUI["DEFAULT_TARGET"]))],
+    )
+    return any(
+        subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        for command in commands
+    )
+
+
+def stop_antigravity():
+    if not antigravity_running():
+        return
+    if not confirm("Antigravity запущен. Завершить его перед патчем?"):
+        raise RuntimeError("GUI не изменён: Antigravity продолжает работать")
+    run(["osascript", "-e", 'tell application "Antigravity" to quit'])
+    deadline = time.monotonic() + 20
+    while antigravity_running():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Antigravity не завершился за 20 секунд; GUI не изменён")
+        time.sleep(0.5)
+
+
+def patch_cli():
+    ensure_patched(CLI, "agy-1.4.12")
+    target = CLI["DEFAULT_TARGET"]
+    run(["codesign", "--force", "--sign", "-", target])
+    run(["codesign", "--verify", "--strict", target])
+    print("CLI готов.")
+
+
+def patch_gui():
+    stop_antigravity()
+    ensure_patched(GUI, "antigravity-2.28.2")
+    target = GUI["DEFAULT_TARGET"]
+    app = Path("/Applications/Antigravity.app")
+    run(["codesign", "--force", "--sign", "-", "--preserve-metadata=entitlements", target])
+    run(["codesign", "--force", "--deep", "--sign", "-", "--preserve-metadata=entitlements", app])
+    run(["codesign", "--verify", "--deep", "--strict", app])
+    print("GUI готов.")
+    if confirm("Запустить Antigravity?"):
+        run(["open", "-a", "Antigravity"])
+
+
+def main():
+    print("agy-patches\n")
+    states = show_states()
+    available = [name for name in ("cli", "gui") if states[name] in ("original", "patched")]
+    if sys.argv[1:] == ["--check"]:
+        return 0 if available else 1
+    if sys.argv[1:]:
+        print("Использование: ./patch [--check]", file=sys.stderr)
+        return 2
+    if not available:
+        print("\nСовместимые установленные версии не найдены.", file=sys.stderr)
+        return 1
+
+    choice = input("\nЧто патчить: 1 — CLI, 2 — GUI, 3 — оба, q — выход. Enter — всё доступное: ").strip().lower()
+    if choice == "q":
+        return 0
+    if not choice:
+        selected = available
+    elif choice == "3" and len(available) == 2:
+        selected = ["cli", "gui"]
+    elif choice == "1" and "cli" in available:
+        selected = ["cli"]
+    elif choice == "2" and "gui" in available:
+        selected = ["gui"]
+    else:
+        print("Выбранный вариант недоступен.", file=sys.stderr)
+        return 1
+
+    for name in selected:
+        print()
+        if name == "cli":
+            patch_cli()
+        else:
+            patch_gui()
+    print("\nГотово.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (KeyboardInterrupt, EOFError):
+        print("\nОтменено.", file=sys.stderr)
+        raise SystemExit(130)
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f"\nОшибка: {error}", file=sys.stderr)
+        raise SystemExit(1)
