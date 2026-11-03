@@ -1,69 +1,97 @@
 #!/usr/bin/env python3
 import argparse
-import hashlib
 import os
 from pathlib import Path
 import shutil
+from struct import unpack_from
 import sys
 import tempfile
 
 DEFAULT_TARGET = Path.home() / ".local/bin/agy"
-ORIGINAL_SHA256 = "34423fc9b0af3841e7646aa72a2d40ffeab8218b22d1cb99eac7355f9eba31e3"
-PATCHED_SHA256 = "bd0f26018c0eb608e00c83f42bcce8ed6c999829bdc24384bf914adb821c92ed"
-OFFSET = 0x277EE6C
-ORIGINAL = bytes.fromhex("420c0037")
-PATCHED = bytes.fromhex("62000014")
+LDRB_W2_X0_8 = bytes.fromhex("02204039")
 
 
-def file_sha256(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def branch_delta(instruction, shift, bits):
+    value = (instruction >> shift) & ((1 << bits) - 1)
+    if value & (1 << (bits - 1)):
+        value -= 1 << bits
+    return value << 2
 
 
-def current_bytes(path):
-    with path.open("rb") as source:
-        source.seek(OFFSET)
-        return source.read(len(ORIGINAL))
+def unconditional_branch(delta):
+    if delta % 4 or not -(1 << 27) <= delta < (1 << 27):
+        raise ValueError("Branch target is out of range")
+    return 0x14000000 | ((delta >> 2) & 0x03FFFFFF)
+
+
+def locate_patch(path):
+    data = path.read_bytes()
+    matches = []
+    start = 0
+    while True:
+        ldrb = data.find(LDRB_W2_X0_8, start)
+        if ldrb < 0:
+            break
+        start = ldrb + 1
+        site = ldrb - 8
+        if site < 0 or site % 4 or site + 16 > len(data):
+            continue
+        error_check, success_check, load, decision = unpack_from("<4I", data, site)
+        if error_check & 0xFF00001F != 0xB5000001:
+            continue
+        if success_check & 0xFF00001F != 0xB4000000:
+            continue
+        success = site + 4 + branch_delta(success_check, 5, 19)
+        if site + branch_delta(error_check, 5, 19) == success:
+            continue
+        patch_offset = site + 12
+        replacement = unconditional_branch(success - patch_offset)
+        if decision & 0xFFF8001F == 0x37000002 and patch_offset + branch_delta(decision, 5, 14) == success:
+            state = "original"
+        elif decision & 0xFC000000 == 0x14000000 and patch_offset + branch_delta(decision, 0, 26) == success:
+            state = "patched"
+        else:
+            continue
+        matches.append((state, patch_offset, decision, replacement))
+    if len(matches) != 1:
+        offsets = ", ".join(hex(match[1]) for match in matches) or "none"
+        raise ValueError(f"Expected one agy eligibility branch, found {len(matches)}: {offsets}")
+    return matches[0]
 
 
 def get_state(path):
     if not path.is_file():
         raise ValueError(f"Target is not a file: {path}")
-    actual = current_bytes(path)
-    if actual == PATCHED:
-        return "patched"
-    if actual != ORIGINAL:
-        raise ValueError(f"Unsupported agy: bytes at {OFFSET:#x} are {actual.hex()}")
-    digest = file_sha256(path)
-    if digest not in (ORIGINAL_SHA256, PATCHED_SHA256):
-        raise ValueError(f"Unsupported agy SHA-256: {digest}")
-    return "original"
+    return locate_patch(path)[0]
 
 
 def apply_patch(path):
+    state, offset, original, replacement = locate_patch(path)
+    if state != "original":
+        raise ValueError(f"Cannot patch target in state: {state}")
+    original_bytes = original.to_bytes(4, "little")
+    replacement_bytes = replacement.to_bytes(4, "little")
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.patch-", dir=path.parent)
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
         shutil.copy2(path, temporary)
         with temporary.open("r+b") as output:
-            output.seek(OFFSET)
-            if output.read(len(ORIGINAL)) != ORIGINAL:
+            output.seek(offset)
+            if output.read(4) != original_bytes:
                 raise ValueError("Target changed while patching")
-            output.seek(OFFSET)
-            output.write(PATCHED)
+            output.seek(offset)
+            output.write(replacement_bytes)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+    return offset, original_bytes, replacement_bytes
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Patch agy 1.4.12 arm64 local eligibility rejection")
+    parser = argparse.ArgumentParser(description="Patch agy arm64 local eligibility rejection")
     parser.add_argument("--target", type=Path, default=DEFAULT_TARGET)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
@@ -72,11 +100,10 @@ def main():
         print(f"{args.target}: {state}")
         if args.check or state == "patched":
             return 0
-        apply_patch(args.target)
-        if current_bytes(args.target) != PATCHED:
+        offset, original, replacement = apply_patch(args.target)
+        if get_state(args.target) != "patched":
             raise ValueError("Patch verification failed")
-        print(f"Patched {OFFSET:#x}: {ORIGINAL.hex()} -> {PATCHED.hex()}")
-        print(f"Unsigned patched SHA-256: {file_sha256(args.target)}")
+        print(f"Patched {offset:#x}: {original.hex()} -> {replacement.hex()}")
         return 0
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

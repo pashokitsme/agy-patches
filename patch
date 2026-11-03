@@ -1,5 +1,6 @@
 #!/usr/bin/env -S uv run --no-project python
-import os
+from datetime import datetime
+import filecmp
 from pathlib import Path
 import re
 import runpy
@@ -51,26 +52,26 @@ def confirm(question, default=True):
     return answer in ("y", "yes", "д", "да")
 
 
-def backup_original(module, version):
+def backup_original(module):
     target = module["DEFAULT_TARGET"]
-    backup = BACKUPS / version / target.name
-    if not backup.exists():
-        backup.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(target, backup)
-    if module["file_sha256"](backup) != module["ORIGINAL_SHA256"]:
-        raise ValueError(f"Резервная копия повреждена или имеет неизвестную версию: {backup}")
+    timestamp = f"{datetime.now():%Y%m%d-%H%M%S}-{time.time_ns()}"
+    backup = BACKUPS / target.name / f"{timestamp}.original"
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(target, backup)
+    if not filecmp.cmp(target, backup, shallow=False):
+        raise ValueError(f"Не удалось проверить резервную копию: {backup}")
     print(f"Резервная копия: {backup}")
 
 
-def ensure_patched(module, version):
+def ensure_patched(module):
     target = module["DEFAULT_TARGET"]
     state = module["get_state"](target)
     if state == "patched":
         print(f"{target}: бинарник уже пропатчен")
         return
-    backup_original(module, version)
+    backup_original(module)
     module["apply_patch"](target)
-    if module["current_bytes"](target) != module["PATCHED"]:
+    if module["get_state"](target) != "patched":
         raise ValueError(f"Не удалось проверить патч: {target}")
     print(f"{target}: патч применён")
 
@@ -100,7 +101,7 @@ def stop_antigravity():
 
 
 def patch_cli():
-    ensure_patched(CLI, "agy-1.4.12")
+    ensure_patched(CLI)
     target = CLI["DEFAULT_TARGET"]
     run(["codesign", "--force", "--sign", "-", target])
     run(["codesign", "--verify", "--strict", target])
@@ -109,7 +110,7 @@ def patch_cli():
 
 def patch_gui():
     stop_antigravity()
-    ensure_patched(GUI, "antigravity-2.28.2")
+    ensure_patched(GUI)
     target = GUI["DEFAULT_TARGET"]
     app = Path("/Applications/Antigravity.app")
     run(["codesign", "--force", "--sign", "-", "--preserve-metadata=entitlements", target])
